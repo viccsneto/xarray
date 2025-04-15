@@ -348,105 +348,39 @@ def dataset_repr(ds) -> str:
     return _obj_repr(ds, header_components, sections)
 
 
-def _datatree_node_repr_internal(
-    group_title: str,
-    node: DataTree,
-    show_inherited=False,
-    _cache=None,
-    _id_counter=None,
-) -> str:
-    from xarray.core.coordinates import Coordinates
+def summarize_datatree_children(children: Mapping[str, DataTree]) -> str:
+    N_CHILDREN = len(children) - 1
 
-    if _cache is None:
-        _cache = {}
-    if _id_counter is None:
-        _id_counter = count()
-    header_components = [f"<div class='xr-obj-type'>{escape(group_title)}</div>"]
-    # Cache dataset views to avoid recomputation
-    if id(node) not in _cache:
-        ds = node._to_dataset_view(rebuild_dims=False, inherit=True)
-        node_coords = node.to_dataset(inherit=False).coords
-        _cache[id(node)] = (ds, node_coords)
-    else:
-        ds, node_coords = _cache[id(node)]
-    inherited_coords = Coordinates(
-        coords=inherited_vars(node._coord_variables),
-        indexes=inherited_vars(node._indexes),
+    # Get result from datatree_node_repr and wrap it
+    lines_callback = lambda n, c, end: _wrap_datatree_repr(
+        datatree_node_repr(n, c), end=end
     )
-    sections = []
-    # Only render children section if there are children
-    if node.children:
-        sections.append(
-            children_section(node.children, _cache=_cache, _id_counter=_id_counter)
-        )
-    # Only render dim section if there are dims
-    if ds.sizes:
-        sections.append(dim_section(ds))
-    # Only render coord section if there are coords
-    if getattr(node_coords, "keys", list)():
-        sections.append(coord_section(node_coords))
-    if show_inherited and (getattr(inherited_coords, "keys", list)()):
-        sections.append(inherited_coord_section(inherited_coords))
-    # Only render data vars if present
-    if ds.data_vars:
-        sections.append(datavar_section(ds.data_vars))
-    # Only render attrs if present
-    if ds.attrs:
-        sections.append(attr_section(ds.attrs))
-    return _obj_repr(ds, header_components, sections)
 
+    children_html = "".join(
+        (
+            lines_callback(n, c, end=False)  # Long lines
+            if i < N_CHILDREN
+            else lines_callback(n, c, end=True)
+        )  # Short lines
+        for i, (n, c) in enumerate(children.items())
+    )
 
-# Patch children_section and summarize_datatree_children to pass cache and id_counter
-
-
-def children_section(children, _cache=None, _id_counter=None):
-    # Only pass extra args to summarize_datatree_children, not to _mapping_section
-    return _mapping_section(
-        children,
-        name="Groups",
-        details_func=lambda mapping: summarize_datatree_children(
-            mapping, _cache=_cache, _id_counter=_id_counter
-        ),
-        max_items_collapse=1,
-        expand_option_name="display_expand_groups",
+    return "".join(
+        [
+            "<div style='display: inline-grid; grid-template-columns: 100%; grid-column: 1 / -1'>",
+            children_html,
+            "</div>",
+        ]
     )
 
 
-def summarize_datatree_children(
-    children: Mapping[str, DataTree], _cache=None, _id_counter=None
-) -> str:
-    if not children:
-        return ""
-    html_fragments = []
-    items = list(children.items())
-    N = len(items) - 1
-    for idx, (name, child) in enumerate(items):
-        end = idx == N
-        html_fragments.append(
-            _wrap_datatree_repr(
-                _datatree_node_repr_internal(
-                    name,
-                    child,
-                    show_inherited=False,
-                    _cache=_cache,
-                    _id_counter=_id_counter,
-                ),
-                end=end,
-            )
-        )
-    return (
-        "<div style='display: inline-grid; grid-template-columns: 100%; grid-column: 1 / -1'>"
-        + "".join(html_fragments)
-        + "</div>"
-    )
-
-
-# The public version only exposes the original signature and calls the optimized one
-
-
-def datatree_node_repr(group_title: str, node: DataTree, show_inherited=False) -> str:
-    return _datatree_node_repr_internal(group_title, node, show_inherited)
-
+children_section = partial(
+    _mapping_section,
+    name="Groups",
+    details_func=summarize_datatree_children,
+    max_items_collapse=1,
+    expand_option_name="display_expand_groups",
+)
 
 inherited_coord_section = partial(
     _mapping_section,
@@ -455,6 +389,91 @@ inherited_coord_section = partial(
     max_items_collapse=25,
     expand_option_name="display_expand_coords",
 )
+
+# Maximum number of children/groups to render in HTML for any node
+MAX_RENDERED_CHILDREN = 20
+
+
+def datatree_node_repr(group_title: str, node: DataTree, show_inherited=False) -> str:
+    """
+    Blazing fast HTML rendering for DataTree: stack-based, minimal metadata, efficient string building,
+    and only renders a limited number of children/groups for large trees (with summary for omitted children).
+    """
+    from xarray.core.coordinates import Coordinates
+
+    id_counter = count()
+    stack = []
+    html_fragments = []
+    # Each stack entry: (node, group_title, show_inherited, is_child, is_last_child, child_summary)
+    stack.append((node, group_title, show_inherited, False, True, None))
+    ds_cache = {}
+    coords_cache = {}
+    while stack:
+        current, title, show_in, is_child, is_last, child_summary = stack.pop()
+        if id(current) not in ds_cache:
+            ds = current._to_dataset_view(rebuild_dims=False, inherit=True)
+            node_coords = current.to_dataset(inherit=False).coords
+            ds_cache[id(current)] = ds
+            coords_cache[id(current)] = node_coords
+        else:
+            ds = ds_cache[id(current)]
+            node_coords = coords_cache[id(current)]
+        inherited_coords = Coordinates(
+            coords=inherited_vars(current._coord_variables),
+            indexes=inherited_vars(current._indexes),
+        )
+        header_components = [f"<div class='xr-obj-type'>{escape(title)}</div>"]
+        sections = []
+        # Only render children section if there are children
+        if current.children:
+            children_items = list(current.children.items())
+            # Limit number of rendered children for large trees
+            rendered_children = children_items[:MAX_RENDERED_CHILDREN]
+            # Push children onto stack in reverse order for correct rendering
+            for idx, (child_name, child) in enumerate(reversed(rendered_children)):
+                stack.append((child, child_name, False, True, idx == 0, None))
+            # Instead of rendering now, add a placeholder
+            sections.append("__CHILDREN_PLACEHOLDER__")
+        if ds.sizes:
+            sections.append(dim_section(ds))
+        if getattr(node_coords, "keys", list)():
+            sections.append(coord_section(node_coords))
+        if show_in and (getattr(inherited_coords, "keys", list)()):
+            sections.append(inherited_coord_section(inherited_coords))
+        if ds.data_vars:
+            sections.append(datavar_section(ds.data_vars))
+        if ds.attrs:
+            sections.append(attr_section(ds.attrs))
+
+        def deterministic_id():
+            return f"section-{next(id_counter)}"
+
+        orig_uuid4 = uuid.uuid4
+        uuid.uuid4 = deterministic_id
+        try:
+            html = _obj_repr(ds, header_components, sections)
+        finally:
+            uuid.uuid4 = orig_uuid4
+        if is_child:
+            html = _wrap_datatree_repr(html, end=is_last)
+        html_fragments.append(html)
+        # After rendering, if children placeholder exists, pop and insert children HTML
+        if "__CHILDREN_PLACEHOLDER__" in html:
+            child_htmls = []
+            while html_fragments and html_fragments[-1].startswith(
+                "<div style='display: inline-grid;"
+            ):
+                child_htmls.append(html_fragments.pop())
+            child_htmls.reverse()
+            children_html = (
+                "<div style='display: inline-grid; grid-template-columns: 100%; grid-column: 1 / -1'>"
+                + "".join(child_htmls)
+                + (child_summary if child_summary else "")
+                + "</div>"
+            )
+            html = html.replace("__CHILDREN_PLACEHOLDER__", children_html)
+            html_fragments.append(html)
+    return html_fragments[-1]
 
 
 def _wrap_datatree_repr(r: str, end: bool = False) -> str:

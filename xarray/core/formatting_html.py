@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from functools import lru_cache, partial
 from html import escape
 from importlib.resources import files
+from itertools import count
 from typing import TYPE_CHECKING
 
 from xarray.core.formatting import (
@@ -347,39 +348,105 @@ def dataset_repr(ds) -> str:
     return _obj_repr(ds, header_components, sections)
 
 
-def summarize_datatree_children(children: Mapping[str, DataTree]) -> str:
-    N_CHILDREN = len(children) - 1
+def _datatree_node_repr_internal(
+    group_title: str,
+    node: DataTree,
+    show_inherited=False,
+    _cache=None,
+    _id_counter=None,
+) -> str:
+    from xarray.core.coordinates import Coordinates
 
-    # Get result from datatree_node_repr and wrap it
-    lines_callback = lambda n, c, end: _wrap_datatree_repr(
-        datatree_node_repr(n, c), end=end
+    if _cache is None:
+        _cache = {}
+    if _id_counter is None:
+        _id_counter = count()
+    header_components = [f"<div class='xr-obj-type'>{escape(group_title)}</div>"]
+    # Cache dataset views to avoid recomputation
+    if id(node) not in _cache:
+        ds = node._to_dataset_view(rebuild_dims=False, inherit=True)
+        node_coords = node.to_dataset(inherit=False).coords
+        _cache[id(node)] = (ds, node_coords)
+    else:
+        ds, node_coords = _cache[id(node)]
+    inherited_coords = Coordinates(
+        coords=inherited_vars(node._coord_variables),
+        indexes=inherited_vars(node._indexes),
+    )
+    sections = []
+    # Only render children section if there are children
+    if node.children:
+        sections.append(
+            children_section(node.children, _cache=_cache, _id_counter=_id_counter)
+        )
+    # Only render dim section if there are dims
+    if ds.sizes:
+        sections.append(dim_section(ds))
+    # Only render coord section if there are coords
+    if getattr(node_coords, "keys", list)():
+        sections.append(coord_section(node_coords))
+    if show_inherited and (getattr(inherited_coords, "keys", list)()):
+        sections.append(inherited_coord_section(inherited_coords))
+    # Only render data vars if present
+    if ds.data_vars:
+        sections.append(datavar_section(ds.data_vars))
+    # Only render attrs if present
+    if ds.attrs:
+        sections.append(attr_section(ds.attrs))
+    return _obj_repr(ds, header_components, sections)
+
+
+# Patch children_section and summarize_datatree_children to pass cache and id_counter
+
+
+def children_section(children, _cache=None, _id_counter=None):
+    # Only pass extra args to summarize_datatree_children, not to _mapping_section
+    return _mapping_section(
+        children,
+        name="Groups",
+        details_func=lambda mapping: summarize_datatree_children(
+            mapping, _cache=_cache, _id_counter=_id_counter
+        ),
+        max_items_collapse=1,
+        expand_option_name="display_expand_groups",
     )
 
-    children_html = "".join(
-        (
-            lines_callback(n, c, end=False)  # Long lines
-            if i < N_CHILDREN
-            else lines_callback(n, c, end=True)
-        )  # Short lines
-        for i, (n, c) in enumerate(children.items())
+
+def summarize_datatree_children(
+    children: Mapping[str, DataTree], _cache=None, _id_counter=None
+) -> str:
+    if not children:
+        return ""
+    html_fragments = []
+    items = list(children.items())
+    N = len(items) - 1
+    for idx, (name, child) in enumerate(items):
+        end = idx == N
+        html_fragments.append(
+            _wrap_datatree_repr(
+                _datatree_node_repr_internal(
+                    name,
+                    child,
+                    show_inherited=False,
+                    _cache=_cache,
+                    _id_counter=_id_counter,
+                ),
+                end=end,
+            )
+        )
+    return (
+        "<div style='display: inline-grid; grid-template-columns: 100%; grid-column: 1 / -1'>"
+        + "".join(html_fragments)
+        + "</div>"
     )
 
-    return "".join(
-        [
-            "<div style='display: inline-grid; grid-template-columns: 100%; grid-column: 1 / -1'>",
-            children_html,
-            "</div>",
-        ]
-    )
+
+# The public version only exposes the original signature and calls the optimized one
 
 
-children_section = partial(
-    _mapping_section,
-    name="Groups",
-    details_func=summarize_datatree_children,
-    max_items_collapse=1,
-    expand_option_name="display_expand_groups",
-)
+def datatree_node_repr(group_title: str, node: DataTree, show_inherited=False) -> str:
+    return _datatree_node_repr_internal(group_title, node, show_inherited)
+
 
 inherited_coord_section = partial(
     _mapping_section,
@@ -388,38 +455,6 @@ inherited_coord_section = partial(
     max_items_collapse=25,
     expand_option_name="display_expand_coords",
 )
-
-
-def datatree_node_repr(group_title: str, node: DataTree, show_inherited=False) -> str:
-    from xarray.core.coordinates import Coordinates
-
-    header_components = [f"<div class='xr-obj-type'>{escape(group_title)}</div>"]
-
-    ds = node._to_dataset_view(rebuild_dims=False, inherit=True)
-    node_coords = node.to_dataset(inherit=False).coords
-
-    # use this class to get access to .xindexes property
-    inherited_coords = Coordinates(
-        coords=inherited_vars(node._coord_variables),
-        indexes=inherited_vars(node._indexes),
-    )
-
-    sections = [
-        children_section(node.children),
-        dim_section(ds),
-        coord_section(node_coords),
-    ]
-
-    # only show inherited coordinates on the root
-    if show_inherited:
-        sections.append(inherited_coord_section(inherited_coords))
-
-    sections += [
-        datavar_section(ds.data_vars),
-        attr_section(ds.attrs),
-    ]
-
-    return _obj_repr(ds, header_components, sections)
 
 
 def _wrap_datatree_repr(r: str, end: bool = False) -> str:

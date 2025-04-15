@@ -1,0 +1,9 @@
+{
+  "arch": "x86_64",
+  "cpu": "12th Gen Intel(R) Core(TM) i9-12900K",
+  "machine": "CodeCaster",
+  "num_cpu": "24",
+  "os": "Linux 5.15.167.4-microsoft-standard-WSL2",
+  "ram": "32749056",
+  "version": 1
+}

@@ -44,6 +44,26 @@ class ReprDataTree:
         self.dt._repr_html_()
 
 
+class ReprDataTreeLarge:
+    def setup(self):
+        # construct a datatree with 10,000 nodes, each with a larger dataset
+        number_of_files = 100
+        number_of_groups = 100
+        n_vars = 10
+        var_len = 100
+        tree_dict = {}
+        for f in range(number_of_files):
+            for g in range(number_of_groups):
+                data_vars = {
+                    f"var_{i}": ("dim", np.arange(var_len) + i) for i in range(n_vars)
+                }
+                tree_dict[f"file_{f}/group_{g}"] = xr.Dataset(data_vars)
+        self.dt = xr.DataTree.from_dict(tree_dict)
+
+    def time_repr_html(self):
+        self.dt._repr_html_()
+
+
 class ReprMultiIndex:
     def setup(self):
         index = pd.MultiIndex.from_product(

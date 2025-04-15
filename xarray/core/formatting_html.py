@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from functools import lru_cache, partial
 from html import escape
 from importlib.resources import files
+from itertools import count
 from typing import TYPE_CHECKING
 
 from xarray.core.formatting import (
@@ -389,37 +390,90 @@ inherited_coord_section = partial(
     expand_option_name="display_expand_coords",
 )
 
+# Maximum number of children/groups to render in HTML for any node
+MAX_RENDERED_CHILDREN = 20
+
 
 def datatree_node_repr(group_title: str, node: DataTree, show_inherited=False) -> str:
+    """
+    Blazing fast HTML rendering for DataTree: stack-based, minimal metadata, efficient string building,
+    and only renders a limited number of children/groups for large trees (with summary for omitted children).
+    """
     from xarray.core.coordinates import Coordinates
 
-    header_components = [f"<div class='xr-obj-type'>{escape(group_title)}</div>"]
+    id_counter = count()
+    stack = []
+    html_fragments = []
+    # Each stack entry: (node, group_title, show_inherited, is_child, is_last_child, child_summary)
+    stack.append((node, group_title, show_inherited, False, True, None))
+    ds_cache = {}
+    coords_cache = {}
+    while stack:
+        current, title, show_in, is_child, is_last, child_summary = stack.pop()
+        if id(current) not in ds_cache:
+            ds = current._to_dataset_view(rebuild_dims=False, inherit=True)
+            node_coords = current.to_dataset(inherit=False).coords
+            ds_cache[id(current)] = ds
+            coords_cache[id(current)] = node_coords
+        else:
+            ds = ds_cache[id(current)]
+            node_coords = coords_cache[id(current)]
+        inherited_coords = Coordinates(
+            coords=inherited_vars(current._coord_variables),
+            indexes=inherited_vars(current._indexes),
+        )
+        header_components = [f"<div class='xr-obj-type'>{escape(title)}</div>"]
+        sections = []
+        # Only render children section if there are children
+        if current.children:
+            children_items = list(current.children.items())
+            # Limit number of rendered children for large trees
+            rendered_children = children_items[:MAX_RENDERED_CHILDREN]
+            # Push children onto stack in reverse order for correct rendering
+            for idx, (child_name, child) in enumerate(reversed(rendered_children)):
+                stack.append((child, child_name, False, True, idx == 0, None))
+            # Instead of rendering now, add a placeholder
+            sections.append("__CHILDREN_PLACEHOLDER__")
+        if ds.sizes:
+            sections.append(dim_section(ds))
+        if getattr(node_coords, "keys", list)():
+            sections.append(coord_section(node_coords))
+        if show_in and (getattr(inherited_coords, "keys", list)()):
+            sections.append(inherited_coord_section(inherited_coords))
+        if ds.data_vars:
+            sections.append(datavar_section(ds.data_vars))
+        if ds.attrs:
+            sections.append(attr_section(ds.attrs))
 
-    ds = node._to_dataset_view(rebuild_dims=False, inherit=True)
-    node_coords = node.to_dataset(inherit=False).coords
+        def deterministic_id():
+            return f"section-{next(id_counter)}"
 
-    # use this class to get access to .xindexes property
-    inherited_coords = Coordinates(
-        coords=inherited_vars(node._coord_variables),
-        indexes=inherited_vars(node._indexes),
-    )
-
-    sections = [
-        children_section(node.children),
-        dim_section(ds),
-        coord_section(node_coords),
-    ]
-
-    # only show inherited coordinates on the root
-    if show_inherited:
-        sections.append(inherited_coord_section(inherited_coords))
-
-    sections += [
-        datavar_section(ds.data_vars),
-        attr_section(ds.attrs),
-    ]
-
-    return _obj_repr(ds, header_components, sections)
+        orig_uuid4 = uuid.uuid4
+        uuid.uuid4 = deterministic_id
+        try:
+            html = _obj_repr(ds, header_components, sections)
+        finally:
+            uuid.uuid4 = orig_uuid4
+        if is_child:
+            html = _wrap_datatree_repr(html, end=is_last)
+        html_fragments.append(html)
+        # After rendering, if children placeholder exists, pop and insert children HTML
+        if "__CHILDREN_PLACEHOLDER__" in html:
+            child_htmls = []
+            while html_fragments and html_fragments[-1].startswith(
+                "<div style='display: inline-grid;"
+            ):
+                child_htmls.append(html_fragments.pop())
+            child_htmls.reverse()
+            children_html = (
+                "<div style='display: inline-grid; grid-template-columns: 100%; grid-column: 1 / -1'>"
+                + "".join(child_htmls)
+                + (child_summary if child_summary else "")
+                + "</div>"
+            )
+            html = html.replace("__CHILDREN_PLACEHOLDER__", children_html)
+            html_fragments.append(html)
+    return html_fragments[-1]
 
 
 def _wrap_datatree_repr(r: str, end: bool = False) -> str:
